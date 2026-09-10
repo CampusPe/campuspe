@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from 'express'
-import { db } from './database.js'
+import { db } from './mongodb-helpers.js'
 import { createSessionToken, hashToken } from './security.js'
 
 const sessionDays = 30
@@ -22,30 +22,36 @@ const readCookie = (request: Request, name: string) => {
   return null
 }
 
-export const createSession = (response: Response, userId: string) => {
+export const createSession = async (response: Response, userId: string) => {
   const token = createSessionToken()
   const tokenHash = hashToken(token)
   const now = new Date()
   const expires = new Date(now.getTime() + sessionDays * 24 * 60 * 60 * 1000)
-  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)').run(tokenHash, userId, expires.toISOString(), now.toISOString())
+  await db.sessions.insert({ token_hash: tokenHash, user_id: userId, expires_at: expires.toISOString(), created_at: now.toISOString() })
   response.cookie(cookieName, token, { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', path: '/', maxAge: sessionDays * 24 * 60 * 60 * 1000 })
 }
 
-export const clearSession = (request: Request, response: Response) => {
+export const clearSession = async (request: Request, response: Response) => {
   const token = readCookie(request, cookieName)
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token))
+  if (token) await db.sessions.delete({ token_hash: hashToken(token) })
   response.clearCookie(cookieName, { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', path: '/' })
 }
 
-export const optionalAuth = (request: Request, _response: Response, next: NextFunction) => {
+export const optionalAuth = async (request: Request, _response: Response, next: NextFunction) => {
   const token = readCookie(request, cookieName)
   if (!token) return next()
   const tokenHash = hashToken(token)
-  const user = db.prepare(`SELECT users.id, users.email, users.name FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token_hash = ? AND sessions.expires_at > ?`).get(tokenHash, new Date().toISOString()) as AuthUser | undefined
-  if (user) { request.user = user; request.sessionTokenHash = tokenHash }
+  const session = await db.sessions.find({ token_hash: tokenHash, expires_at: { $gt: new Date().toISOString() } })
+  if (session) {
+    const user = await db.users.find({ id: session.user_id })
+    if (user) {
+      request.user = { id: user.id, email: user.email, name: user.name }
+      request.sessionTokenHash = tokenHash
+    }
+  }
   next()
 }
 
-export const requireAuth = (request: Request, response: Response, next: NextFunction) => {
-  optionalAuth(request, response, () => request.user ? next() : response.status(401).json({ error: { code: 'AUTH_REQUIRED', message: 'Please log in.' } }))
+export const requireAuth = async (request: Request, response: Response, next: NextFunction) => {
+  await optionalAuth(request, response, () => request.user ? next() : response.status(401).json({ error: { code: 'AUTH_REQUIRED', message: 'Please log in.' } }))
 }

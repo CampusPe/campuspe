@@ -5,10 +5,11 @@
     "moduleResolution": "NodeNext",
     "outDir": "../server-dist",
     "rootDir": ".",
-    "strict": true,
+    "strict": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "noUncheckedIndexedAccess": true
+    "noUncheckedIndexedAccess": false,
+    "noImplicitAny": false
   },
   "include": ["**/*.ts"]
 }

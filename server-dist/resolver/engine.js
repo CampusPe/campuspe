@@ -1,16 +1,19 @@
 import { randomUUID } from 'node:crypto';
-import { db } from '../database.js';
+import { db } from '../mongodb-helpers.js';
 import { decryptJson, encryptJson } from '../security.js';
 import { classifyQuestion, normalizeQuestion, questionSimilarity } from './normalizer.js';
 import { approvedDeclarationAnswer, manualPolicyReason, nonDisclosureOption, nonInferableFields, sensitiveFields } from './policy.js';
 import { OllamaAnswerProvider } from './ollama.js';
 import { matchNoticePeriodOption } from './optionMatcher.js';
 const emptyDemographics = { gender: 'prefer', orientation: 'prefer', ethnicity: 'prefer', disability: 'prefer', veteran: 'prefer' };
-function loadCandidate(userId) {
-    const row = db.prepare('SELECT users.name, users.email, profiles.* FROM profiles JOIN users ON users.id=profiles.user_id WHERE profiles.user_id=?').get(userId);
-    if (!row)
+async function loadCandidate(userId) {
+    const profile = await db.profiles.find({ user_id: userId });
+    if (!profile)
         throw new Error('Candidate profile not found.');
-    return { name: String(row.name), email: String(row.email), phone: String(row.phone), phoneCountryCode: String(row.phone_country_code), location: String(row.location), currentCity: String(row.current_city), currentState: String(row.current_state), currentCountry: String(row.current_country), linkedinUrl: String(row.linkedin_url), githubUrl: String(row.github_url), portfolioUrl: String(row.portfolio_url), experienceYears: String(row.experience_years), noticePeriod: String(row.notice_period), workAuthorized: String(row.work_authorized), sponsorship: String(row.sponsorship), currentSalary: String(row.current_salary), expectedSalary: String(row.expected_salary), workArrangement: String(row.work_arrangement), willingInOffice: String(row.willing_in_office), willingRelocate: String(row.willing_relocate), usWorkAuthorized: String(row.us_work_authorized), usSponsorship: String(row.us_sponsorship), usVisaType: String(row.us_visa_type), activeImmigrationCase: String(row.active_immigration_case), referralSource: String(row.referral_source), careerMotivation: String(row.career_motivation), coverLetterIntro: String(row.cover_letter_intro), additionalInformation: String(row.additional_information), experiences: JSON.parse(String(row.experiences_json || '[]')), education: JSON.parse(String(row.education_json || '[]')), demographics: decryptJson(String(row.demographics_encrypted || ''), emptyDemographics), allowDemographicSuggestions: Boolean(row.allow_demographic_suggestions) };
+    const user = await db.users.find({ id: userId });
+    if (!user)
+        throw new Error('User not found.');
+    return { name: String(user.name), email: String(user.email), phone: String(profile.phone), phoneCountryCode: String(profile.phone_country_code), location: String(profile.location), currentCity: String(profile.current_city), currentState: String(profile.current_state), currentCountry: String(profile.current_country), linkedinUrl: String(profile.linkedin_url), githubUrl: String(profile.github_url), portfolioUrl: String(profile.portfolio_url), experienceYears: String(profile.experience_years), noticePeriod: String(profile.notice_period), workAuthorized: String(profile.work_authorized), sponsorship: String(profile.sponsorship), currentSalary: String(profile.current_salary), expectedSalary: String(profile.expected_salary), workArrangement: String(profile.work_arrangement), willingInOffice: String(profile.willing_in_office), willingRelocate: String(profile.willing_relocate), usWorkAuthorized: String(profile.us_work_authorized), usSponsorship: String(profile.us_sponsorship), usVisaType: String(profile.us_visa_type), activeImmigrationCase: String(profile.active_immigration_case), referralSource: String(profile.referral_source), careerMotivation: String(profile.career_motivation), coverLetterIntro: String(profile.cover_letter_intro), additionalInformation: String(profile.additional_information), experiences: JSON.parse(String(profile.experiences_json || '[]')), education: JSON.parse(String(profile.education_json || '[]')), demographics: decryptJson(String(profile.demographics_encrypted || ''), emptyDemographics), allowDemographicSuggestions: Boolean(profile.allow_demographic_suggestions) };
 }
 function l1Lookup(field, candidate) {
     const nameParts = candidate.name.trim().split(/\s+/);
@@ -66,8 +69,8 @@ function l1Lookup(field, candidate) {
     }
     return null;
 }
-function loadMemory(userId, normalized, canonical, job) {
-    const rows = db.prepare('SELECT * FROM answer_memory WHERE user_id=? ORDER BY last_used_at DESC, approved_at DESC LIMIT 200').all(userId);
+async function loadMemory(userId, normalized, canonical, job) {
+    const rows = await db.answerMemory.find({ user_id: userId });
     let best = null;
     for (const row of rows) {
         if (row.scope === 'company' && (!job.company || row.company?.toLowerCase() !== job.company.toLowerCase()))
@@ -90,16 +93,16 @@ export class AnswerResolver {
         const canonical = classifyQuestion(normalized);
         const approvedDeclaration = approvedDeclarationAnswer(normalized, question.options);
         if (approvedDeclaration)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: approvedDeclaration, source: 'L1_PROFILE', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Used your explicit approval for the no-recording and no-transcribing acknowledgement.' });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: approvedDeclaration, source: 'L1_PROFILE', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Used your explicit approval for the no-recording and no-transcribing acknowledgement.' });
         const manualReason = manualPolicyReason(normalized);
         if (manualReason && options.testMode && question.options?.length) {
             const testAnswer = question.options.find((option) => /^(?:yes|i agree|i acknowledge|agree)$/i.test(option.trim())) ?? question.options[0];
             if (testAnswer)
-                return this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: testAnswer, source: 'L3_LLM', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Testing mode selected a visible option. This run cannot be submitted.' });
+                return await this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: testAnswer, source: 'L3_LLM', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Testing mode selected a visible option. This run cannot be submitted.' });
         }
         if (manualReason)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: manualReason, canonicalField: canonical, pauseCode: 'RESTRICTED_QUESTION' });
-        const candidate = loadCandidate(userId);
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: manualReason, canonicalField: canonical, pauseCode: 'RESTRICTED_QUESTION' });
+        const candidate = await loadCandidate(userId);
         let l1 = l1Lookup(canonical, candidate);
         if (canonical === 'declaration_date') {
             const today = new Date();
@@ -119,61 +122,61 @@ export class AnswerResolver {
             const matchedOption = this.visibleOption(l1.answer, question.options);
             if (!matchedOption) {
                 if (canonical && (sensitiveFields.has(canonical) || nonInferableFields.has(canonical)))
-                    return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'Your saved profile answer does not match any option shown by this employer.', canonicalField: canonical, pauseCode: 'MISSING_PROFILE_VALUE' });
+                    return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'Your saved profile answer does not match any option shown by this employer.', canonicalField: canonical, pauseCode: 'MISSING_PROFILE_VALUE' });
                 l1 = null;
             }
             else
                 l1 = { ...l1, answer: matchedOption };
         }
         if (l1)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: l1.answer, source: 'L1_PROFILE', confidence: l1.confidence, requiresReview: l1.review, canonicalField: canonical, explanation: l1.explanation });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: l1.answer, source: 'L1_PROFILE', confidence: l1.confidence, requiresReview: l1.review, canonicalField: canonical, explanation: l1.explanation });
         if (canonical && sensitiveFields.has(canonical) && options.testMode) {
             const privateOption = nonDisclosureOption(question.options);
             if (privateOption)
-                return this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: privateOption, source: 'L3_LLM', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Testing mode used the employer’s non-disclosure option because no explicit demographic answer was saved.' });
+                return await this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: privateOption, source: 'L3_LLM', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Testing mode used the employer’s non-disclosure option because no explicit demographic answer was saved.' });
         }
         if (canonical && sensitiveFields.has(canonical) && !options.testMode)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'This voluntary answer was not explicitly enabled and saved in the profile.', canonicalField: canonical, pauseCode: 'RESTRICTED_QUESTION' });
-        const memory = loadMemory(userId, normalized, canonical, job);
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'This voluntary answer was not explicitly enabled and saved in the profile.', canonicalField: canonical, pauseCode: 'RESTRICTED_QUESTION' });
+        const memory = await loadMemory(userId, normalized, canonical, job);
         if (memory) {
             const rememberedAnswer = decryptJson(memory.row.answer_encrypted, '');
             const matchedMemoryOption = question.options?.length ? this.visibleOption(rememberedAnswer, question.options) : rememberedAnswer;
             if (matchedMemoryOption === null)
-                return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'Your previously approved answer does not match any option shown by this employer.', canonicalField: canonical, pauseCode: 'MISSING_PROFILE_VALUE' });
-            db.prepare('UPDATE answer_memory SET usage_count=usage_count+1, last_used_at=? WHERE id=?').run(new Date().toISOString(), memory.row.id);
-            return this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: matchedMemoryOption, source: 'L2_MEMORY', confidence: Number(memory.score.toFixed(2)), requiresReview: sensitiveFields.has(canonical ?? ''), canonicalField: canonical, explanation: 'Reused a previously approved answer to a semantically similar question.', memoryId: memory.row.id });
+                return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'Your previously approved answer does not match any option shown by this employer.', canonicalField: canonical, pauseCode: 'MISSING_PROFILE_VALUE' });
+            await db.answerMemory.update({ id: memory.row.id }, { usage_count: (memory.row.usage_count || 0) + 1, last_used_at: new Date().toISOString() });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: matchedMemoryOption, source: 'L2_MEMORY', confidence: Number(memory.score.toFixed(2)), requiresReview: sensitiveFields.has(canonical ?? ''), canonicalField: canonical, explanation: 'Reused a previously approved answer to a semantically similar question.', memoryId: memory.row.id });
         }
         if (canonical && nonInferableFields.has(canonical) && !options.testMode)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'This factual or preference answer must come from your profile or a previously approved answer.', canonicalField: canonical, pauseCode: 'RESTRICTED_QUESTION' });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'This factual or preference answer must come from your profile or a previously approved answer.', canonicalField: canonical, pauseCode: 'RESTRICTED_QUESTION' });
         if ((question.fieldType === 'select' || question.fieldType === 'boolean') && !question.options?.length)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'This is a choice control, but its visible options could not be read reliably. JobCopilot will not type a generated sentence into it.', canonicalField: canonical, pauseCode: 'MISSING_PROFILE_VALUE' });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'This is a choice control, but its visible options could not be read reliably. JobCopilot will not type a generated sentence into it.', canonicalField: canonical, pauseCode: 'MISSING_PROFILE_VALUE' });
         if (!this.llm && options.testMode)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: this.testAnswer(question), source: 'L3_LLM', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Used a testing-only fallback because no model is configured. This run cannot be submitted.' });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: this.testAnswer(question), source: 'L3_LLM', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Used a testing-only fallback because no model is configured. This run cannot be submitted.' });
         if (!this.llm)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'No reliable profile or approved-memory answer was found, and no LLM provider is configured.', canonicalField: canonical, pauseCode: 'LLM_NOT_CONFIGURED' });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'No reliable profile or approved-memory answer was found, and no LLM provider is configured.', canonicalField: canonical, pauseCode: 'LLM_NOT_CONFIGURED' });
         const draft = await this.llm.resolve({ question, normalizedQuestion: normalized, canonicalField: canonical, candidate, job });
         if (!draft && options.testMode)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: this.testAnswer(question), source: 'L3_LLM', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Used a testing-only fallback because the model declined. This run cannot be submitted.' });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: this.testAnswer(question), source: 'L3_LLM', confidence: 1, requiresReview: true, canonicalField: canonical, explanation: 'Used a testing-only fallback because the model declined. This run cannot be submitted.' });
         if (!draft)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'The LLM declined to generate a reliable answer.', canonicalField: canonical, pauseCode: 'LLM_DECLINED' });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'The LLM declined to generate a reliable answer.', canonicalField: canonical, pauseCode: 'LLM_DECLINED' });
         if (draft.confidence < .75 && !options.testMode)
-            return this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'The generated draft did not meet the confidence threshold.', canonicalField: canonical, pauseCode: 'LOW_CONFIDENCE' });
-        return this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: draft.answer, source: 'L3_LLM', confidence: draft.confidence, requiresReview: true, canonicalField: canonical, explanation: draft.explanation });
+            return await this.finish(userId, question, job, normalized, canonical, { status: 'NEEDS_USER_INPUT', reason: 'The generated draft did not meet the confidence threshold.', canonicalField: canonical, pauseCode: 'LOW_CONFIDENCE' });
+        return await this.finish(userId, question, job, normalized, canonical, { status: 'RESOLVED', answer: draft.answer, source: 'L3_LLM', confidence: draft.confidence, requiresReview: true, canonicalField: canonical, explanation: draft.explanation });
     }
-    remember(userId, input) {
+    async remember(userId, input) {
         const normalized = normalizeQuestion(input.question.text);
         const canonical = classifyQuestion(normalized);
         const now = new Date().toISOString();
         const id = randomUUID();
-        db.prepare('INSERT INTO answer_memory (id,user_id,question_text,normalized_question,canonical_field,field_type,answer_encrypted,scope,company,approved_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(id, userId, input.question.text, normalized, canonical, input.question.fieldType, encryptJson(input.answer), input.scope, input.scope === 'company' ? input.company || null : null, now, now);
+        await db.answerMemory.insert({ id, user_id: userId, question_text: input.question.text, normalized_question: normalized, canonical_field: canonical, field_type: input.question.fieldType, answer_encrypted: encryptJson(input.answer), scope: input.scope, company: input.scope === 'company' ? input.company || null : null, approved_at: now, created_at: now });
         return { id, normalizedQuestion: normalized, canonicalField: canonical };
     }
-    listMemory(userId) {
-        const rows = db.prepare('SELECT id,question_text,normalized_question,canonical_field,field_type,answer_encrypted,scope,company,approved_at,last_used_at,usage_count FROM answer_memory WHERE user_id=? ORDER BY approved_at DESC').all(userId);
+    async listMemory(userId) {
+        const rows = await db.answerMemory.find({ user_id: userId });
         return rows.map((row) => ({ id: row.id, question: row.question_text, normalizedQuestion: row.normalized_question, canonicalField: row.canonical_field, fieldType: row.field_type, answer: decryptJson(row.answer_encrypted, ''), scope: row.scope, company: row.company, approvedAt: row.approved_at, lastUsedAt: row.last_used_at, usageCount: row.usage_count }));
     }
-    finish(userId, question, job, normalized, canonical, result) {
-        db.prepare('INSERT INTO resolution_log (id,user_id,question_text,normalized_question,canonical_field,status,source,confidence,reason,company,job_title,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(randomUUID(), userId, question.text, normalized, canonical, result.status, result.status === 'RESOLVED' ? result.source : null, result.status === 'RESOLVED' ? result.confidence : null, result.status === 'NEEDS_USER_INPUT' ? result.reason : null, job.company || null, job.jobTitle || null, new Date().toISOString());
+    async finish(userId, question, job, normalized, canonical, result) {
+        await db.resolutionLog.insert({ id: randomUUID(), user_id: userId, question_text: question.text, normalized_question: normalized, canonical_field: canonical, status: result.status, source: result.status === 'RESOLVED' ? result.source : null, confidence: result.status === 'RESOLVED' ? result.confidence : null, reason: result.status === 'NEEDS_USER_INPUT' ? result.reason : null, company: job.company || null, job_title: job.jobTitle || null, created_at: new Date().toISOString() });
         return result;
     }
     visibleOption(answer, options) {

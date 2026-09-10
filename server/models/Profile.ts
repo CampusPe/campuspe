@@ -1,0 +1,45 @@
+import mongoose, { Schema } from 'mongoose'
+
+const ProfileSchema = new Schema({
+  user_id: { type: String, required: true, unique: true },
+  phone: { type: String, default: '' },
+  phone_country_code: { type: String, default: '' },
+  location: { type: String, default: '' },
+  current_city: { type: String, default: '' },
+  current_state: { type: String, default: '' },
+  current_country: { type: String, default: '' },
+  linkedin_url: { type: String, default: '' },
+  github_url: { type: String, default: '' },
+  portfolio_url: { type: String, default: '' },
+  experience_years: { type: String, default: '' },
+  notice_period: { type: String, default: '' },
+  work_authorized: { type: String, default: '' },
+  sponsorship: { type: String, default: '' },
+  current_salary: { type: String, default: '' },
+  expected_salary: { type: String, default: '' },
+  work_arrangement: { type: String, default: '' },
+  willing_in_office: { type: String, default: '' },
+  willing_relocate: { type: String, default: '' },
+  us_work_authorized: { type: String, default: '' },
+  us_sponsorship: { type: String, default: '' },
+  us_visa_type: { type: String, default: '' },
+  active_immigration_case: { type: String, default: '' },
+  referral_source: { type: String, default: '' },
+  career_motivation: { type: String, default: '' },
+  cover_letter_intro: { type: String, default: '' },
+  additional_information: { type: String, default: '' },
+  experiences_json: { type: String, default: '[]' },
+  education_json: { type: String, default: '[]' },
+  demographics_encrypted: { type: String },
+  allow_demographic_suggestions: { type: Number, default: 0 },
+  resume_filename: { type: String },
+  resume_storage_name: { type: String },
+  resume_mime: { type: String },
+  updated_at: { type: String, required: true },
+}, { 
+  timestamps: false
+})
+
+const Profile = mongoose.models.Profile || mongoose.model('Profile', ProfileSchema)
+
+export default Profile

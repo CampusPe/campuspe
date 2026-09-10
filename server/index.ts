@@ -8,7 +8,7 @@ import multer from 'multer'
 import { z, ZodError } from 'zod'
 import { clearSession, createSession, optionalAuth, requireAuth } from './auth.js'
 import { dataDir, port, rootDir, tailoredResumeDir, uploadDir } from './config.js'
-import { db } from './database.js'
+import { db, cleanupExpiredSessions } from './mongodb-helpers.js'
 import { decryptJson, encryptJson, hashPassword, verifyPassword } from './security.js'
 import { answerResolver } from './resolver/engine.js'
 import { automationManager } from './automation/manager.js'
@@ -17,12 +17,22 @@ import { City, Country, State } from 'country-state-city'
 import { getRecommendedJobs } from './jobs.js'
 import { extractResumeText, extractTargetJob, optimizeResume, reviewResume } from './resumeReview.js'
 import { createTailoredResumeDocx, tailoredResumePreviewHtml } from './resumeDocument.js'
+import connectDB from './mongodb.js'
+import ResolutionLog from './models/ResolutionLog.js'
+import SavedJob from './models/SavedJob.js'
+import ResumeOptimization from './models/ResumeOptimization.js'
+import Profile from './models/Profile.js'
+import User from './models/User.js'
 
 const app = express()
 app.disable('x-powered-by')
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }))
 app.use(express.json({ limit: '1mb' }))
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: 'draft-8', legacyHeaders: false }))
+
+// Connect to MongoDB
+await connectDB()
+await cleanupExpiredSessions()
 
 const credentialsSchema = z.object({ email: z.string().trim().email().max(255), password: z.string().min(8).max(128) })
 const signupSchema = credentialsSchema.extend({ name: z.string().trim().min(1).max(100) })
@@ -57,38 +67,44 @@ const resumeOptimizationIdSchema = z.object({ id: z.string().uuid() })
 
 app.get('/api/health', (_request, response) => response.json({ data: { status: 'ok', database: dataDir } }))
 
-app.post('/api/auth/signup', (request, response, next) => {
+app.post('/api/auth/signup', async (request, response, next) => {
   try {
     const input = signupSchema.parse(request.body)
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(input.email)
+    const existing = await db.users.find({ email: input.email.toLowerCase() })
     if (existing) return response.status(409).json({ error: { code: 'EMAIL_EXISTS', message: 'An account with this email already exists.' } })
     const userId = randomUUID()
     const password = hashPassword(input.password)
     const now = new Date().toISOString()
-    db.prepare('INSERT INTO users (id, email, name, password_hash, password_salt, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(userId, input.email.toLowerCase(), input.name, password.hash, password.salt, now)
-    db.prepare('INSERT INTO profiles (user_id, updated_at) VALUES (?, ?)').run(userId, now)
-    createSession(response, userId)
+    await db.users.insert({ id: userId, email: input.email.toLowerCase(), name: input.name, password_hash: password.hash, password_salt: password.salt, created_at: now })
+    await db.profiles.insert({ user_id: userId, updated_at: now })
+    await createSession(response, userId)
     return response.status(201).json({ data: { user: { id: userId, name: input.name, email: input.email.toLowerCase() } } })
   } catch (error) { next(error) }
 })
 
-app.post('/api/auth/login', (request, response, next) => {
+app.post('/api/auth/login', async (request, response, next) => {
   try {
     const input = credentialsSchema.parse(request.body)
-    const user = db.prepare('SELECT id, email, name, password_hash, password_salt FROM users WHERE email = ?').get(input.email) as { id: string; email: string; name: string; password_hash: string; password_salt: string } | undefined
+    const user = await db.users.find({ email: input.email.toLowerCase() }) as { id: string; email: string; name: string; password_hash: string; password_salt: string } | undefined
     if (!user || !verifyPassword(input.password, user.password_salt, user.password_hash)) return response.status(401).json({ error: { code: 'INVALID_CREDENTIALS', message: 'Email or password is incorrect.' } })
-    createSession(response, user.id)
+    await createSession(response, user.id)
     return response.json({ data: { user: { id: user.id, name: user.name, email: user.email } } })
   } catch (error) { next(error) }
 })
 
-app.post('/api/auth/logout', requireAuth, (request, response) => { clearSession(request, response); response.status(204).end() })
-app.get('/api/auth/me', optionalAuth, (request, response) => request.user ? response.json({ data: { user: request.user } }) : response.status(401).json({ error: { code: 'AUTH_REQUIRED', message: 'Please log in.' } }))
+app.post('/api/auth/logout', requireAuth, async (request, response) => { await clearSession(request, response); response.status(204).end() })
+app.get('/api/auth/me', optionalAuth, async (request, response) => request.user ? response.json({ data: { user: request.user } }) : response.status(401).json({ error: { code: 'AUTH_REQUIRED', message: 'Please log in.' } }))
 
-const getProfile = (userId: string) => db.prepare('SELECT users.name, users.email, profiles.* FROM profiles JOIN users ON users.id = profiles.user_id WHERE profiles.user_id = ?').get(userId) as Record<string, unknown> | undefined
+const getProfile = async (userId: string) => {
+  const profile = await db.profiles.find({ user_id: userId })
+  if (!profile) return undefined
+  const user = await db.users.find({ id: userId })
+  if (!user) return undefined
+  return { ...profile, name: user.name, email: user.email }
+}
 
-app.get('/api/profile', requireAuth, (request, response) => {
-  const row = getProfile(request.user!.id)
+app.get('/api/profile', requireAuth, async (request, response) => {
+  const row = await getProfile(request.user!.id)
   if (!row) return response.status(404).json({ error: { code: 'PROFILE_NOT_FOUND', message: 'Profile not found.' } })
   response.json({ data: { profile: {
     name: row.name, email: row.email, phone: row.phone, phoneCountryCode: row.phone_country_code, location: row.location, currentCity: row.current_city, currentState: row.current_state, currentCountry: row.current_country, linkedinUrl: row.linkedin_url, githubUrl: row.github_url, portfolioUrl: row.portfolio_url, experienceYears: row.experience_years, noticePeriod: row.notice_period, workAuthorized: row.work_authorized, sponsorship: row.sponsorship, currentSalary: row.current_salary, expectedSalary: row.expected_salary, workArrangement: row.work_arrangement, willingInOffice: row.willing_in_office, willingRelocate: row.willing_relocate, usWorkAuthorized: row.us_work_authorized, usSponsorship: row.us_sponsorship, usVisaType: row.us_visa_type, activeImmigrationCase: row.active_immigration_case, referralSource: row.referral_source, careerMotivation: row.career_motivation, coverLetterIntro: row.cover_letter_intro, additionalInformation: row.additional_information,
@@ -111,33 +127,33 @@ app.get('/api/locations/cities/:countryCode/:stateCode', requireAuth, (request, 
   } catch (error) { next(error) }
 })
 
-app.put('/api/profile', requireAuth, (request, response, next) => {
+app.put('/api/profile', requireAuth, async (request, response, next) => {
   try {
     const input = profileSchema.parse(request.body)
     const now = new Date().toISOString()
-    db.prepare('UPDATE users SET name = ? WHERE id = ?').run(input.name, request.user!.id)
-    db.prepare(`UPDATE profiles SET phone=?, phone_country_code=?, location=?, current_city=?, current_state=?, current_country=?, linkedin_url=?, github_url=?, portfolio_url=?, experience_years=?, notice_period=?, work_authorized=?, sponsorship=?, current_salary=?, expected_salary=?, work_arrangement=?, willing_in_office=?, willing_relocate=?, us_work_authorized=?, us_sponsorship=?, us_visa_type=?, active_immigration_case=?, referral_source=?, career_motivation=?, cover_letter_intro=?, additional_information=?, experiences_json=?, education_json=?, demographics_encrypted=?, allow_demographic_suggestions=?, updated_at=? WHERE user_id=?`).run(
-      input.phone, input.phoneCountryCode, [input.currentCity, input.currentState, input.currentCountry].filter(Boolean).join(', '), input.currentCity, input.currentState, input.currentCountry, input.linkedinUrl, input.githubUrl, input.portfolioUrl, input.experienceYears, input.noticePeriod, input.workAuthorized, input.sponsorship, input.currentSalary, input.expectedSalary, input.workArrangement, input.willingInOffice, input.willingRelocate, input.usWorkAuthorized, input.usSponsorship, input.usVisaType, input.activeImmigrationCase, input.referralSource, input.careerMotivation, input.coverLetterIntro, input.additionalInformation, JSON.stringify(input.experiences), JSON.stringify(input.education), encryptJson(input.demographics), input.allowDemographicSuggestions ? 1 : 0, now, request.user!.id,
-    )
+    await db.users.update({ id: request.user!.id }, { name: input.name })
+    await db.profiles.update({ user_id: request.user!.id }, {
+      phone: input.phone, phone_country_code: input.phoneCountryCode, location: [input.currentCity, input.currentState, input.currentCountry].filter(Boolean).join(', '), current_city: input.currentCity, current_state: input.currentState, current_country: input.currentCountry, linkedin_url: input.linkedinUrl, github_url: input.githubUrl, portfolio_url: input.portfolioUrl, experience_years: input.experienceYears, notice_period: input.noticePeriod, work_authorized: input.workAuthorized, sponsorship: input.sponsorship, current_salary: input.currentSalary, expected_salary: input.expectedSalary, work_arrangement: input.workArrangement, willing_in_office: input.willingInOffice, willing_relocate: input.willingRelocate, us_work_authorized: input.usWorkAuthorized, us_sponsorship: input.usSponsorship, us_visa_type: input.usVisaType, active_immigration_case: input.activeImmigrationCase, referral_source: input.referralSource, career_motivation: input.careerMotivation, cover_letter_intro: input.coverLetterIntro, additional_information: input.additionalInformation, experiences_json: JSON.stringify(input.experiences), education_json: JSON.stringify(input.education), demographics_encrypted: encryptJson(input.demographics), allow_demographic_suggestions: input.allowDemographicSuggestions ? 1 : 0, updated_at: now,
+    })
     response.json({ data: { saved: true, updatedAt: now } })
   } catch (error) { next(error) }
 })
 
 const upload = multer({ storage: multer.diskStorage({ destination: uploadDir, filename: (_request, file, callback) => callback(null, `${randomUUID()}${file.originalname.toLowerCase().endsWith('.pdf') ? '.pdf' : file.originalname.toLowerCase().endsWith('.docx') ? '.docx' : '.doc'}`) }), limits: { fileSize: 10 * 1024 * 1024, files: 1 }, fileFilter: (_request, file, callback) => callback(null, ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].includes(file.mimetype)) })
 
-app.post('/api/profile/resume', requireAuth, upload.single('resume'), (request, response) => {
+app.post('/api/profile/resume', requireAuth, upload.single('resume'), async (request, response) => {
   if (!request.file) return response.status(400).json({ error: { code: 'FILE_REQUIRED', message: 'Choose a PDF, DOC, or DOCX resume.' } })
-  const current = getProfile(request.user!.id)
+  const current = await getProfile(request.user!.id)
   if (current?.resume_storage_name) {
     const oldPath = resolve(uploadDir, String(current.resume_storage_name))
     if (oldPath.startsWith(uploadDir) && existsSync(oldPath)) unlinkSync(oldPath)
   }
-  db.prepare('UPDATE profiles SET resume_filename=?, resume_storage_name=?, resume_mime=?, updated_at=? WHERE user_id=?').run(request.file.originalname, request.file.filename, request.file.mimetype, new Date().toISOString(), request.user!.id)
+  await db.profiles.update({ user_id: request.user!.id }, { resume_filename: request.file.originalname, resume_storage_name: request.file.filename, resume_mime: request.file.mimetype, updated_at: new Date().toISOString() })
   response.json({ data: { resume: { filename: request.file.originalname, mime: request.file.mimetype } } })
 })
 
-app.get('/api/profile/resume/file', requireAuth, (request, response) => {
-  const profile = getProfile(request.user!.id)
+app.get('/api/profile/resume/file', requireAuth, async (request, response) => {
+  const profile = await getProfile(request.user!.id)
   if (!profile?.resume_storage_name) return response.status(404).json({ error: { code: 'RESUME_NOT_FOUND', message: 'Upload a resume from your profile first.' } })
   const resumePath = resolve(uploadDir, String(profile.resume_storage_name))
   if (!resumePath.startsWith(`${uploadDir}/`) || !existsSync(resumePath)) return response.status(404).json({ error: { code: 'RESUME_NOT_FOUND', message: 'The saved resume file could not be found.' } })
@@ -150,7 +166,7 @@ app.get('/api/profile/resume/file', requireAuth, (request, response) => {
 app.post('/api/profile/resume/review', requireAuth, async (request, response, next) => {
   try {
     const input = resumeReviewSchema.parse(request.body || {})
-    const profile = getProfile(request.user!.id)
+    const profile = await getProfile(request.user!.id)
     if (!profile?.resume_storage_name) return response.status(404).json({ error: { code: 'RESUME_NOT_FOUND', message: 'Upload a resume from your profile first.' } })
     const resumePath = resolve(uploadDir, String(profile.resume_storage_name))
     if (!resumePath.startsWith(`${uploadDir}/`) || !existsSync(resumePath)) return response.status(404).json({ error: { code: 'RESUME_NOT_FOUND', message: 'The saved resume file could not be found.' } })
@@ -164,7 +180,7 @@ app.post('/api/profile/resume/review', requireAuth, async (request, response, ne
 app.post('/api/profile/resume/optimize', requireAuth, async (request, response, next) => {
   try {
     const input = resumeOptimizationSchema.parse(request.body)
-    const profile = getProfile(request.user!.id)
+    const profile = await getProfile(request.user!.id)
     if (!profile?.resume_storage_name) return response.status(404).json({ error: { code: 'RESUME_NOT_FOUND', message: 'Upload a resume from your profile first.' } })
     const resumePath = resolve(uploadDir, String(profile.resume_storage_name))
     if (!resumePath.startsWith(`${uploadDir}/`) || !existsSync(resumePath)) return response.status(404).json({ error: { code: 'RESUME_NOT_FOUND', message: 'The saved resume file could not be found.' } })
@@ -175,8 +191,7 @@ app.post('/api/profile/resume/optimize', requireAuth, async (request, response, 
     const id = randomUUID(); const now = new Date().toISOString(); const status = input.mode === 'automatic' ? 'APPROVED' : 'DRAFT'
     const storageName = status === 'APPROVED' ? `${id}.docx` : null
     if (storageName) await createTailoredResumeDocx(proposal.tailoredResumeText, resolve(tailoredResumeDir, storageName))
-    db.prepare('INSERT INTO resume_optimizations (id,user_id,job_url,job_title,company,mode,status,proposal_json,storage_name,created_at,approved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-      .run(id, request.user!.id, job.url, job.title, job.company, input.mode, status, JSON.stringify(proposal), storageName, now, status === 'APPROVED' ? now : null)
+    await db.resumeOptimizations.insert({ id, user_id: request.user!.id, job_url: job.url, job_title: job.title, company: job.company, mode: input.mode, status, proposal_json: JSON.stringify(proposal), storage_name: storageName, created_at: now, approved_at: status === 'APPROVED' ? now : null })
     response.setHeader('Cache-Control', 'private, no-store')
     response.status(201).json({ data: { optimization: { id, mode: input.mode, status, job: { url: job.url, title: job.title, company: job.company, location: job.location }, proposal } } })
   } catch (error) { next(error) }
@@ -185,35 +200,35 @@ app.post('/api/profile/resume/optimize', requireAuth, async (request, response, 
 app.post('/api/profile/resume/optimizations/:id/approve', requireAuth, async (request, response, next) => {
   try {
     const { id } = resumeOptimizationIdSchema.parse(request.params)
-    const row = db.prepare('SELECT proposal_json FROM resume_optimizations WHERE id=? AND user_id=?').get(id, request.user!.id) as { proposal_json: string } | undefined
-    if (!row) return response.status(404).json({ error: { code: 'OPTIMIZATION_NOT_FOUND', message: 'Tailored resume draft not found.' } })
-    const proposal = JSON.parse(row.proposal_json) as { tailoredResumeText: string }; const storageName = `${id}.docx`
+    const optimization = await db.resumeOptimizations.findOne({ id, user_id: request.user!.id }) as { proposal_json: string } | undefined
+    if (!optimization) return response.status(404).json({ error: { code: 'OPTIMIZATION_NOT_FOUND', message: 'Tailored resume draft not found.' } })
+    const proposal = JSON.parse(optimization.proposal_json) as { tailoredResumeText: string }; const storageName = `${id}.docx`
     await createTailoredResumeDocx(proposal.tailoredResumeText, resolve(tailoredResumeDir, storageName))
-    db.prepare("UPDATE resume_optimizations SET status='APPROVED', storage_name=?, approved_at=? WHERE id=? AND user_id=?").run(storageName, new Date().toISOString(), id, request.user!.id)
+    await db.resumeOptimizations.update({ id, user_id: request.user!.id }, { status: 'APPROVED', storage_name: storageName, approved_at: new Date().toISOString() })
     response.json({ data: { approved: true } })
   } catch (error) { next(error) }
 })
 
-app.get('/api/profile/resume/optimizations/:id/download', requireAuth, (request, response, next) => {
+app.get('/api/profile/resume/optimizations/:id/download', requireAuth, async (request, response, next) => {
   try {
     const { id } = resumeOptimizationIdSchema.parse(request.params)
-    const row = db.prepare('SELECT job_title,company,status,storage_name FROM resume_optimizations WHERE id=? AND user_id=?').get(id, request.user!.id) as { job_title: string; company: string; status: string; storage_name: string | null } | undefined
-    if (!row) return response.status(404).json({ error: { code: 'OPTIMIZATION_NOT_FOUND', message: 'Tailored resume draft not found.' } })
-    if (row.status !== 'APPROVED') return response.status(409).json({ error: { code: 'APPROVAL_REQUIRED', message: 'Approve this tailored resume before downloading it.' } })
-    const filename = `tailored-resume-${row.company}-${row.job_title}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100)
-    if (!row.storage_name) return response.status(404).json({ error: { code: 'TAILORED_FILE_NOT_FOUND', message: 'The tailored Word file has not been generated.' } })
-    const filePath = resolve(tailoredResumeDir, row.storage_name)
+    const optimization = await db.resumeOptimizations.findOne({ id, user_id: request.user!.id }) as { job_title: string; company: string; status: string; storage_name: string | null } | undefined
+    if (!optimization) return response.status(404).json({ error: { code: 'OPTIMIZATION_NOT_FOUND', message: 'Tailored resume draft not found.' } })
+    if (optimization.status !== 'APPROVED') return response.status(409).json({ error: { code: 'APPROVAL_REQUIRED', message: 'Approve this tailored resume before downloading it.' } })
+    const filename = `tailored-resume-${optimization.company}-${optimization.job_title}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100)
+    if (!optimization.storage_name) return response.status(404).json({ error: { code: 'TAILORED_FILE_NOT_FOUND', message: 'The tailored Word file has not been generated.' } })
+    const filePath = resolve(tailoredResumeDir, optimization.storage_name)
     if (!filePath.startsWith(`${tailoredResumeDir}/`) || !existsSync(filePath)) return response.status(404).json({ error: { code: 'TAILORED_FILE_NOT_FOUND', message: 'The tailored Word file could not be found.' } })
     response.setHeader('Cache-Control', 'private, no-store'); response.type('application/vnd.openxmlformats-officedocument.wordprocessingml.document'); response.download(filePath, `${filename}.docx`)
   } catch (error) { next(error) }
 })
 
-app.get('/api/profile/resume/optimizations/:id/preview', requireAuth, (request, response, next) => {
+app.get('/api/profile/resume/optimizations/:id/preview', requireAuth, async (request, response, next) => {
   try {
     const { id } = resumeOptimizationIdSchema.parse(request.params)
-    const row = db.prepare('SELECT proposal_json FROM resume_optimizations WHERE id=? AND user_id=?').get(id, request.user!.id) as { proposal_json: string } | undefined
-    if (!row) return response.status(404).type('text/plain').send('Tailored resume preview not found.')
-    const proposal = JSON.parse(row.proposal_json) as { tailoredResumeText: string }
+    const optimization = await db.resumeOptimizations.findOne({ id, user_id: request.user!.id }) as { proposal_json: string } | undefined
+    if (!optimization) return response.status(404).type('text/plain').send('Tailored resume preview not found.')
+    const proposal = JSON.parse(optimization.proposal_json) as { tailoredResumeText: string }
     response.setHeader('Cache-Control', 'private, no-store'); response.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'")
     response.type('html').send(tailoredResumePreviewHtml(proposal.tailoredResumeText))
   } catch (error) { next(error) }
@@ -227,18 +242,18 @@ app.post('/api/resolver/resolve', requireAuth, async (request, response, next) =
   } catch (error) { next(error) }
 })
 
-app.post('/api/resolver/memory', requireAuth, (request, response, next) => {
+app.post('/api/resolver/memory', requireAuth, async (request, response, next) => {
   try {
     const input = rememberSchema.parse(request.body)
-    const memory = answerResolver.remember(request.user!.id, input)
+    const memory = await answerResolver.remember(request.user!.id, input as any)
     response.status(201).json({ data: { memory } })
   } catch (error) { next(error) }
 })
 
 app.get('/api/resolver/memory', requireAuth, (request, response) => response.json({ data: { memories: answerResolver.listMemory(request.user!.id) } }))
 
-app.get('/api/resolver/logs', requireAuth, (request, response) => {
-  const logs = db.prepare('SELECT id,question_text,normalized_question,canonical_field,status,source,confidence,reason,company,job_title,created_at FROM resolution_log WHERE user_id=? ORDER BY created_at DESC LIMIT 100').all(request.user!.id)
+app.get('/api/resolver/logs', requireAuth, async (request, response) => {
+  const logs = await db.resolutionLog.find({ user_id: request.user!.id })
   response.json({ data: { logs } })
 })
 
@@ -262,25 +277,29 @@ app.get('/api/jobs/recommended', requireAuth, async (request, response, next) =>
   } catch (error) { next(error) }
 })
 
-app.get('/api/jobs/saved', requireAuth, (request, response) => {
-  const rows = db.prepare('SELECT job_json, saved_at FROM saved_jobs WHERE user_id=? ORDER BY saved_at DESC').all(request.user!.id) as Array<{ job_json: string; saved_at: string }>
-  response.json({ data: { jobs: rows.map((row) => ({ ...JSON.parse(row.job_json), savedAt: row.saved_at })) } })
+app.get('/api/jobs/saved', requireAuth, async (request, response) => {
+  const rows = await db.savedJobs.find({ user_id: request.user!.id })
+  response.json({ data: { jobs: rows.map((row: any) => ({ ...JSON.parse(row.job_json), savedAt: row.saved_at })) } })
 })
 
-app.put('/api/jobs/saved', requireAuth, (request, response, next) => {
+app.put('/api/jobs/saved', requireAuth, async (request, response, next) => {
   try {
     const job = recommendedJobSchema.parse(request.body)
     const savedAt = new Date().toISOString()
-    db.prepare('INSERT INTO saved_jobs (user_id, job_id, job_json, saved_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, job_id) DO UPDATE SET job_json=excluded.job_json, saved_at=excluded.saved_at')
-      .run(request.user!.id, job.id, JSON.stringify(job), savedAt)
+    const existing = await db.savedJobs.find({ user_id: request.user!.id, job_id: job.id })
+    if (existing && existing.length > 0) {
+      await db.savedJobs.update({ user_id: request.user!.id, job_id: job.id }, { job_json: JSON.stringify(job), saved_at: savedAt })
+    } else {
+      await db.savedJobs.insert({ user_id: request.user!.id, job_id: job.id, job_json: JSON.stringify(job), saved_at: savedAt })
+    }
     response.json({ data: { job, savedAt } })
   } catch (error) { next(error) }
 })
 
-app.delete('/api/jobs/saved', requireAuth, (request, response, next) => {
+app.delete('/api/jobs/saved', requireAuth, async (request, response, next) => {
   try {
     const { jobId } = savedJobIdSchema.parse(request.body)
-    db.prepare('DELETE FROM saved_jobs WHERE user_id=? AND job_id=?').run(request.user!.id, jobId)
+    await db.savedJobs.delete({ user_id: request.user!.id, job_id: jobId })
     response.status(204).end()
   } catch (error) { next(error) }
 })

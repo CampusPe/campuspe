@@ -5,6 +5,7 @@ node_modules/
 data/
 uploads/
 browser-data/
+.env
 
 .DS_Store
 *.log

@@ -9,8 +9,9 @@
     "dev:api": "tsx watch server/index.ts",
     "build": "tsc -b && vite build && tsc -p server/tsconfig.json",
     "test": "node --import tsx --test server/**/*.test.ts",
-    "start": "node server-dist/index.js",
-    "preview": "vite preview"
+    "start": "node --loader tsx server/index.ts",
+    "preview": "vite preview",
+    "postinstall": "npm run build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
@@ -21,6 +22,8 @@
     "helmet": "latest",
     "lucide-react": "latest",
     "mammoth": "^1.12.2",
+    "mongodb": "^6.3.0",
+    "mongoose": "^8.0.3",
     "multer": "latest",
     "pdf-parse": "^2.4.5",
     "playwright-core": "latest",
